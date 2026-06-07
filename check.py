@@ -1,28 +1,23 @@
 """
-check.py  —  YT Watcher playlist checker
-Runs every 10 min via GitHub Actions.
-Reads playlists/subscriptions from Cloudflare Worker KV.
-Sends Web Push notifications via pywebpush.
+check.py — YT Watcher
+- YouTube playlist monitoring + push notifications
+- Schedule event notifications (notifyBefore)
 """
-import os, json, urllib.request
+import os, json, urllib.request, datetime
 from pywebpush import webpush, WebPushException
 
-YOUTUBE_API_KEY   = os.environ["YOUTUBE_API_KEY"]
-VAPID_PRIVATE_KEY = os.environ["VAPID_PRIVATE_KEY"]
-VAPID_EMAIL       = os.environ.get("VAPID_EMAIL", "mailto:a6068376@gmail.com")
-WORKER_URL        = os.environ["WORKER_URL"].rstrip("/")
-API_SECRET        = os.environ["API_SECRET"]
-
-# Fallback: read playlists from env if Worker is unavailable
+YOUTUBE_API_KEY    = os.environ["YOUTUBE_API_KEY"]
+VAPID_PRIVATE_KEY  = os.environ["VAPID_PRIVATE_KEY"]
+VAPID_EMAIL        = os.environ.get("VAPID_EMAIL", "mailto:a6068376@gmail.com")
+WORKER_URL         = os.environ["WORKER_URL"].rstrip("/")
+API_SECRET         = os.environ["API_SECRET"]
 PLAYLISTS_FALLBACK = os.environ.get("PLAYLISTS_JSON", "[]")
-
 
 def worker_get(path):
     url = f"{WORKER_URL}{path}?secret={API_SECRET}"
-    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "yt-watcher-check"})
+    req = urllib.request.Request(url, headers={"Accept":"application/json","User-Agent":"yt-watcher"})
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read())
-
 
 def yt_playlist_videos(playlist_id):
     videos, page_token = [], ""
@@ -33,7 +28,7 @@ def yt_playlist_videos(playlist_id):
         with urllib.request.urlopen(urllib.request.Request(url), timeout=20) as r:
             data = json.loads(r.read())
         for item in data.get("items", []):
-            s   = item["snippet"]
+            s = item["snippet"]
             vid = s.get("resourceId", {}).get("videoId")
             if not vid or s["title"] in ("Deleted video", "Private video"):
                 continue
@@ -43,7 +38,6 @@ def yt_playlist_videos(playlist_id):
             break
     return videos
 
-
 def send_push(sub, title, body, url=""):
     try:
         webpush(
@@ -52,20 +46,56 @@ def send_push(sub, title, body, url=""):
             vapid_private_key=VAPID_PRIVATE_KEY,
             vapid_claims={"sub": VAPID_EMAIL},
         )
-        print(f"    ✓ {sub['endpoint'][:60]}…")
+        print(f"    sent → {sub['endpoint'][:55]}...")
         return True
     except WebPushException as e:
         resp = getattr(e, "response", None)
         code = resp.status_code if resp else 0
-        print(f"    ✗ {code}: {str(e)[:80]}")
-        return code != 410   # 410 Gone = subscription expired, remove it
+        print(f"    fail {code}: {str(e)[:80]}")
+        return code != 410
     except Exception as e:
-        print(f"    ✗ error: {e}")
+        print(f"    error: {e}")
         return True
 
+def push_all(subs, title, body, url=""):
+    for sub in subs:
+        send_push(sub, title, body, url)
+
+def check_schedule_notifications(schedules, subs):
+    if not schedules or not subs:
+        return 0
+    now_jst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    today   = now_jst.strftime("%Y-%m-%d")
+    now_min = now_jst.hour * 60 + now_jst.minute
+    sent = 0
+    for ev in schedules:
+        if not ev.get("notify"):
+            continue
+        if ev.get("date") != today:
+            continue
+        start = ev.get("startTime", "")
+        if not start:
+            continue
+        try:
+            h, m = map(int, start.split(":"))
+        except Exception:
+            continue
+        start_min = h * 60 + m
+        for nb in ev.get("notifyBefore", [60, 30, 10]):
+            diff = now_min - (start_min - nb)
+            if 0 <= diff <= 2:
+                subject = ev.get("subject", "")
+                unit    = ev.get("unit", "")
+                link    = ev.get("link", {}).get("url") or ev.get("zoomUrl", "")
+                title_  = f"まもなく開始: {subject}"
+                body_   = f"{unit}  {start}開始  {nb}分前"
+                print(f"  [sched] {title_} — {body_}")
+                push_all(subs, title_, body_, link)
+                sent += 1
+                break
+    return sent
 
 def main():
-    # ── Load state ────────────────────────────────────────────────────────────
     state = {}
     if os.path.exists("state.json"):
         try:
@@ -74,90 +104,62 @@ def main():
         except Exception:
             pass
 
-    # ── Fetch playlists ───────────────────────────────────────────────────────
-    try:
-        playlists = worker_get("/playlists")
-        print(f"[playlists] {len(playlists)} from Worker KV")
-    except Exception as e:
-        print(f"[playlists] Worker unreachable ({e}), using PLAYLISTS_JSON env")
-        try:
-            playlists = json.loads(PLAYLISTS_FALLBACK)
-        except Exception:
-            print("[error] Cannot load playlists")
-            return
-
-    # ── Fetch subscriptions ───────────────────────────────────────────────────
+    # Fetch subscriptions
     try:
         subs = worker_get("/subscriptions")
-        if not isinstance(subs, list):
-            subs = []
-        print(f"[subscriptions] {len(subs)} from Worker KV")
+        if not isinstance(subs, list): subs = []
+        print(f"[subs] {len(subs)}件")
     except Exception as e:
-        print(f"[subscriptions] error: {e}")
+        print(f"[subs] error: {e}")
         subs = []
 
-    if not subs:
-        print("[skip] No subscribers — nothing to notify")
-        # Still update state so we track new videos for when someone subscribes
-    if not playlists:
-        print("[skip] No playlists configured")
-        return
+    # Fetch playlists
+    try:
+        playlists = worker_get("/playlists")
+        print(f"[playlists] {len(playlists)}件 (KV)")
+    except Exception as e:
+        print(f"[playlists] fallback: {e}")
+        try:    playlists = json.loads(PLAYLISTS_FALLBACK)
+        except: playlists = []
 
-    # ── Check each playlist ───────────────────────────────────────────────────
+    # Fetch schedules
+    try:
+        schedules = worker_get("/schedules")
+        if not isinstance(schedules, list): schedules = []
+        print(f"[schedules] {len(schedules)}件")
+    except Exception as e:
+        print(f"[schedules] {e}")
+        schedules = []
+
+    # Check playlists
     for pl in playlists:
         pl_id    = pl.get("id", "")
         pl_title = pl.get("title", pl_id)
-        if not pl_id:
-            continue
-
-        print(f"\n[playlist] {pl_title}  ({pl_id})")
-
+        if not pl_id: continue
+        print(f"\n[playlist] {pl_title} ({pl_id})")
         try:
             videos = yt_playlist_videos(pl_id)
         except Exception as e:
-            print(f"  [error] {e}")
-            continue
-
+            print(f"  error: {e}"); continue
         known      = set(state.get(pl_id, []))
         new_videos = [v for v in videos if v["id"] not in known]
         print(f"  total={len(videos)}, known={len(known)}, new={len(new_videos)}")
-
-        state[pl_id] = [v["id"] for v in videos]   # always update
-
-        if not new_videos or not subs:
-            continue
-
-        for v in new_videos:
-            print(f"  [new] {v['title']}")
-
-        # ── Send push ─────────────────────────────────────────────────────────
-        print(f"  [push] notifying {len(subs)} subscriber(s)…")
-
-        # One notification per new video (max 3), then a summary
-        notify_videos = new_videos[:3]
-        for v in notify_videos:
-            for sub in subs:
-                send_push(
-                    sub,
-                    title=f"新着: {pl_title}",
-                    body=v["title"],
-                    url=f"https://www.youtube.com/watch?v={v['id']}",
-                )
-
+        state[pl_id] = [v["id"] for v in videos]
+        if not new_videos or not subs: continue
+        for v in new_videos: print(f"  [new] {v['title']}")
+        for v in new_videos[:3]:
+            push_all(subs, f"新着: {pl_title}", v["title"], f"https://www.youtube.com/watch?v={v['id']}")
         if len(new_videos) > 3:
-            for sub in subs:
-                send_push(
-                    sub,
-                    title=f"{pl_title}: 他 {len(new_videos) - 3} 件の新着",
-                    body="タップして確認",
-                    url=f"https://www.youtube.com/playlist?list={pl_id}",
-                )
+            push_all(subs, f"{pl_title}: 他{len(new_videos)-3}件の新着", "タップして確認", f"https://www.youtube.com/playlist?list={pl_id}")
 
-    # ── Save state ────────────────────────────────────────────────────────────
+    # Check schedule notifications
+    print("\n[schedule check]")
+    n = check_schedule_notifications(schedules, subs)
+    print(f"  {n}件送信")
+
     with open("state.json", "w") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
-    print("\n[state] saved")
-
+    print("\n[done]")
 
 if __name__ == "__main__":
     main()
